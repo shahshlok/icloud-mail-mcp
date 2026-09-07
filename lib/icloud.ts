@@ -92,6 +92,24 @@ function formatAddressList(
     .join(", ");
 }
 
+function parsedAddressText(value: unknown): string {
+  if (!value) return "";
+
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => parsedAddressText(item))
+      .filter(Boolean)
+      .join(", ");
+  }
+
+  if (typeof value === "object" && value !== null && "text" in value) {
+    const text = (value as { text?: unknown }).text;
+    return typeof text === "string" ? text : "";
+  }
+
+  return "";
+}
+
 function toIsoString(value: string | Date | null | undefined): string | null {
   if (!value) return null;
 
@@ -220,12 +238,12 @@ export async function readEmail(uid: number): Promise<ReadEmail> {
       return {
         uid: metadata.uid,
         from:
-          parsed.from?.text ||
+          parsedAddressText(parsed.from) ||
           formatAddressList(metadata.envelope?.from) ||
           "(unknown sender)",
-        to: parsed.to?.text || formatAddressList(metadata.envelope?.to),
-        cc: parsed.cc?.text || formatAddressList(metadata.envelope?.cc),
-        replyTo: parsed.replyTo?.text || "",
+        to: parsedAddressText(parsed.to) || formatAddressList(metadata.envelope?.to),
+        cc: parsedAddressText(parsed.cc) || formatAddressList(metadata.envelope?.cc),
+        replyTo: parsedAddressText(parsed.replyTo),
         subject: parsed.subject || metadata.envelope?.subject || "(no subject)",
         date: toIsoString(
           parsed.date ?? metadata.envelope?.date ?? metadata.internalDate ?? null,

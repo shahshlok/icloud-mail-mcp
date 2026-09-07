@@ -1,9 +1,12 @@
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
+import { marked } from "marked";
 import nodemailer from "nodemailer";
+import sanitizeHtml from "sanitize-html";
 
 export type MailboxName = "inbox" | "sent";
 export type MailboxScope = MailboxName | "both";
+export type EmailBodyFormat = "markdown" | "plain";
 
 export type RecentEmail = {
   mailbox: MailboxName;
@@ -50,6 +53,7 @@ export type SendEmailInput = {
   bcc?: string[];
   subject: string;
   body: string;
+  format?: EmailBodyFormat;
 };
 
 export type SendEmailResult = {
@@ -148,6 +152,51 @@ function normalizeAddresses(values: unknown): string[] {
   return values.map((value) => String(value));
 }
 
+function renderMarkdownEmail(markdown: string): string {
+  const rendered = marked.parse(markdown, {
+    async: false,
+    gfm: true,
+    breaks: true,
+  });
+
+  const rawHtml = typeof rendered === "string" ? rendered : "";
+
+  return sanitizeHtml(rawHtml, {
+    allowedTags: [
+      "p",
+      "br",
+      "strong",
+      "b",
+      "em",
+      "i",
+      "del",
+      "h1",
+      "h2",
+      "h3",
+      "h4",
+      "ul",
+      "ol",
+      "li",
+      "a",
+      "blockquote",
+      "code",
+      "pre",
+      "hr",
+      "table",
+      "thead",
+      "tbody",
+      "tr",
+      "th",
+      "td",
+    ],
+    allowedAttributes: {
+      a: ["href", "title"],
+    },
+    allowedSchemes: ["http", "https", "mailto"],
+    allowProtocolRelative: false,
+  });
+}
+
 async function resolveMailboxPath(
   client: ImapFlow,
   mailbox: MailboxName,
@@ -187,12 +236,16 @@ async function fetchEmailSummaries(
   if (!uids.length) return [];
 
   const emails: RecentEmail[] = [];
-  for await (const message of client.fetch(uids.join(","), {
-    uid: true,
-    envelope: true,
-    flags: true,
-    internalDate: true,
-  }, { uid: true })) {
+  for await (const message of client.fetch(
+    uids.join(","),
+    {
+      uid: true,
+      envelope: true,
+      flags: true,
+      internalDate: true,
+    },
+    { uid: true },
+  )) {
     const flags = message.flags ?? new Set<string>();
     const messageDate = message.envelope?.date ?? message.internalDate ?? null;
 
@@ -385,6 +438,7 @@ export async function sendEmail(input: SendEmailInput): Promise<SendEmailResult>
   const user = requiredEnv("ICLOUD_IMAP_USERNAME");
   const pass = requiredEnv("ICLOUD_APP_PASSWORD");
   const from = getFromAddress();
+  const format = input.format ?? "markdown";
 
   const transporter = nodemailer.createTransport({
     host: "smtp.mail.me.com",
@@ -397,22 +451,25 @@ export async function sendEmail(input: SendEmailInput): Promise<SendEmailResult>
     socketTimeout: 30_000,
   });
 
-  const info = await transporter.sendMail({
-    from,
-    to: input.to,
-    cc: input.cc?.length ? input.cc : undefined,
-    bcc: input.bcc?.length ? input.bcc : undefined,
-    subject: input.subject,
-    text: input.body,
-  });
+  try {
+    const info = await transporter.sendMail({
+      from,
+      to: input.to,
+      cc: input.cc?.length ? input.cc : undefined,
+      bcc: input.bcc?.length ? input.bcc : undefined,
+      subject: input.subject,
+      text: input.body,
+      html: format === "markdown" ? renderMarkdownEmail(input.body) : undefined,
+    });
 
-  transporter.close();
-
-  return {
-    sent: true,
-    from,
-    messageId: info.messageId || null,
-    accepted: normalizeAddresses(info.accepted),
-    rejected: normalizeAddresses(info.rejected),
-  };
+    return {
+      sent: true,
+      from,
+      messageId: info.messageId || null,
+      accepted: normalizeAddresses(info.accepted),
+      rejected: normalizeAddresses(info.rejected),
+    };
+  } finally {
+    transporter.close();
+  }
 }

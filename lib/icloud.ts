@@ -31,6 +31,13 @@ function formatAddressList(
     .join(", ");
 }
 
+function toIsoString(value: string | Date | null | undefined): string | null {
+  if (!value) return null;
+
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
 export async function listRecentEmails(limit: number): Promise<RecentEmail[]> {
   const user = requiredEnv("ICLOUD_IMAP_USERNAME");
   const pass = requiredEnv("ICLOUD_APP_PASSWORD");
@@ -52,7 +59,12 @@ export async function listRecentEmails(limit: number): Promise<RecentEmail[]> {
     const lock = await client.getMailboxLock("INBOX");
 
     try {
-      const exists = client.mailbox.exists;
+      const mailbox = client.mailbox;
+      if (!mailbox) {
+        throw new Error("INBOX is not open");
+      }
+
+      const exists = mailbox.exists;
       if (!exists) return [];
 
       const start = Math.max(1, exists - limit + 1);
@@ -71,7 +83,7 @@ export async function listRecentEmails(limit: number): Promise<RecentEmail[]> {
           uid: message.uid,
           from: formatAddressList(message.envelope?.from),
           subject: message.envelope?.subject || "(no subject)",
-          date: messageDate ? messageDate.toISOString() : null,
+          date: toIsoString(messageDate),
           unread: !flags.has("\\Seen"),
         });
       }

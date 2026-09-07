@@ -8,6 +8,8 @@
     "start": "next start"
   },
   "dependencies": {
+    "@clerk/mcp-tools": "^0.6.0",
+    "@clerk/nextjs": "^7.9.1",
     "@modelcontextprotocol/server": "^2.0.0",
     "imapflow": "^1.7.8",
     "mcp-handler": "^2.1.1",
@@ -23,6 +25,6 @@
     "typescript": "^6.0.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.9.0"
   }
 }

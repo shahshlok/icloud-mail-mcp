@@ -2,15 +2,21 @@ import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import nodemailer from "nodemailer";
 
+export type MailboxName = "inbox" | "sent";
+export type MailboxScope = MailboxName | "both";
+
 export type RecentEmail = {
+  mailbox: MailboxName;
   uid: number;
   from: string;
+  to: string;
   subject: string;
   date: string | null;
   unread: boolean;
 };
 
 export type ReadEmail = {
+  mailbox: MailboxName;
   uid: number;
   from: string;
   to: string;
@@ -27,6 +33,15 @@ export type ReadEmail = {
     contentType: string;
     size: number;
   }>;
+};
+
+export type SearchEmailsInput = {
+  mailbox: MailboxScope;
+  from?: string;
+  to?: string;
+  subject?: string;
+  text?: string;
+  limit: number;
 };
 
 export type SendEmailInput = {
@@ -133,20 +148,86 @@ function normalizeAddresses(values: unknown): string[] {
   return values.map((value) => String(value));
 }
 
-export async function listRecentEmails(limit: number): Promise<RecentEmail[]> {
+async function resolveMailboxPath(
+  client: ImapFlow,
+  mailbox: MailboxName,
+): Promise<string> {
+  if (mailbox === "inbox") return "INBOX";
+
+  const mailboxes = await client.list();
+  const sentBySpecialUse = mailboxes.find((item) => item.specialUse === "\\Sent");
+  if (sentBySpecialUse) return sentBySpecialUse.path;
+
+  const sentByName = mailboxes.find((item) =>
+    /(^|[/\\])(sent|sent messages|sent items)$/i.test(item.path),
+  );
+  if (sentByName) return sentByName.path;
+
+  throw new Error("Could not find the iCloud Sent mailbox.");
+}
+
+function mailboxTargets(scope: MailboxScope): MailboxName[] {
+  if (scope === "both") return ["inbox", "sent"];
+  return [scope];
+}
+
+function sortNewestFirst<T extends { date: string | null }>(items: T[]): T[] {
+  return items.sort((a, b) => {
+    if (!a.date) return 1;
+    if (!b.date) return -1;
+    return b.date.localeCompare(a.date);
+  });
+}
+
+async function fetchEmailSummaries(
+  client: ImapFlow,
+  mailbox: MailboxName,
+  uids: number[],
+): Promise<RecentEmail[]> {
+  if (!uids.length) return [];
+
+  const emails: RecentEmail[] = [];
+  for await (const message of client.fetch(uids.join(","), {
+    uid: true,
+    envelope: true,
+    flags: true,
+    internalDate: true,
+  }, { uid: true })) {
+    const flags = message.flags ?? new Set<string>();
+    const messageDate = message.envelope?.date ?? message.internalDate ?? null;
+
+    emails.push({
+      mailbox,
+      uid: message.uid,
+      from: formatAddressList(message.envelope?.from) || "(unknown sender)",
+      to: formatAddressList(message.envelope?.to),
+      subject: message.envelope?.subject || "(no subject)",
+      date: toIsoString(messageDate),
+      unread: !flags.has("\\Seen"),
+    });
+  }
+
+  return sortNewestFirst(emails);
+}
+
+export async function listRecentEmails(
+  limit: number,
+  mailbox: MailboxName = "inbox",
+): Promise<RecentEmail[]> {
   const client = createImapClient();
   await client.connect();
 
   try {
-    const lock = await client.getMailboxLock("INBOX");
+    const path = await resolveMailboxPath(client, mailbox);
+    const lock = await client.getMailboxLock(path);
 
     try {
-      const mailbox = client.mailbox;
-      if (!mailbox) {
-        throw new Error("INBOX is not open");
+      const openedMailbox = client.mailbox;
+      if (!openedMailbox) {
+        throw new Error(`${path} is not open`);
       }
 
-      const exists = mailbox.exists;
+      const exists = openedMailbox.exists;
       if (!exists) return [];
 
       const start = Math.max(1, exists - limit + 1);
@@ -162,21 +243,17 @@ export async function listRecentEmails(limit: number): Promise<RecentEmail[]> {
         const messageDate = message.envelope?.date ?? message.internalDate ?? null;
 
         emails.push({
+          mailbox,
           uid: message.uid,
           from: formatAddressList(message.envelope?.from) || "(unknown sender)",
+          to: formatAddressList(message.envelope?.to),
           subject: message.envelope?.subject || "(no subject)",
           date: toIsoString(messageDate),
           unread: !flags.has("\\Seen"),
         });
       }
 
-      return emails
-        .sort((a, b) => {
-          if (!a.date) return 1;
-          if (!b.date) return -1;
-          return b.date.localeCompare(a.date);
-        })
-        .slice(0, limit);
+      return sortNewestFirst(emails).slice(0, limit);
     } finally {
       lock.release();
     }
@@ -185,12 +262,49 @@ export async function listRecentEmails(limit: number): Promise<RecentEmail[]> {
   }
 }
 
-export async function readEmail(uid: number): Promise<ReadEmail> {
+export async function searchEmails(input: SearchEmailsInput): Promise<RecentEmail[]> {
   const client = createImapClient();
   await client.connect();
 
   try {
-    const lock = await client.getMailboxLock("INBOX");
+    const results: RecentEmail[] = [];
+
+    for (const mailbox of mailboxTargets(input.mailbox)) {
+      const path = await resolveMailboxPath(client, mailbox);
+      const lock = await client.getMailboxLock(path);
+
+      try {
+        const criteria: Record<string, unknown> = {};
+        if (input.from?.trim()) criteria.from = input.from.trim();
+        if (input.to?.trim()) criteria.to = input.to.trim();
+        if (input.subject?.trim()) criteria.subject = input.subject.trim();
+        if (input.text?.trim()) criteria.text = input.text.trim();
+
+        const found = await client.search(criteria as never, { uid: true });
+        const uids = Array.isArray(found) ? found : [];
+        const selected = uids.slice(-Math.max(input.limit * 3, input.limit));
+        results.push(...(await fetchEmailSummaries(client, mailbox, selected)));
+      } finally {
+        lock.release();
+      }
+    }
+
+    return sortNewestFirst(results).slice(0, input.limit);
+  } finally {
+    await client.logout().catch(() => undefined);
+  }
+}
+
+export async function readEmail(
+  uid: number,
+  mailbox: MailboxName = "inbox",
+): Promise<ReadEmail> {
+  const client = createImapClient();
+  await client.connect();
+
+  try {
+    const path = await resolveMailboxPath(client, mailbox);
+    const lock = await client.getMailboxLock(path);
 
     try {
       const metadata = await client.fetchOne(
@@ -206,7 +320,7 @@ export async function readEmail(uid: number): Promise<ReadEmail> {
       );
 
       if (!metadata) {
-        throw new Error(`No INBOX message found with UID ${uid}.`);
+        throw new Error(`No ${mailbox} message found with UID ${uid}.`);
       }
 
       if (metadata.size && metadata.size > MAX_MESSAGE_BYTES) {
@@ -236,6 +350,7 @@ export async function readEmail(uid: number): Promise<ReadEmail> {
       const flags = metadata.flags ?? new Set<string>();
 
       return {
+        mailbox,
         uid: metadata.uid,
         from:
           parsedAddressText(parsed.from) ||

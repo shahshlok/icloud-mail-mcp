@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   listRecentEmails,
   readEmail,
+  searchEmails,
   sendEmail,
 } from "../../../lib/icloud";
 
@@ -41,9 +42,14 @@ function authenticatedUserId(ctx: {
   return userId;
 }
 
+const mailboxSchema = z.enum(["inbox", "sent"]);
+const mailboxScopeSchema = z.enum(["inbox", "sent", "both"]);
+
 const recentEmailSchema = z.object({
+  mailbox: mailboxSchema,
   uid: z.number().int(),
   from: z.string(),
+  to: z.string(),
   subject: z.string(),
   date: z.string().nullable(),
   unread: z.boolean(),
@@ -56,6 +62,7 @@ const attachmentSchema = z.object({
 });
 
 const readEmailSchema = z.object({
+  mailbox: mailboxSchema,
   uid: z.number().int(),
   from: z.string(),
   to: z.string(),
@@ -78,15 +85,32 @@ const sendResultSchema = z.object({
   rejected: z.array(z.string()),
 });
 
+const searchInputSchema = z
+  .object({
+    mailbox: mailboxScopeSchema.default("both").describe(
+      "Search inbox, sent mail, or both. Use sent for questions about messages the user sent.",
+    ),
+    from: z.string().max(500).optional().describe("Sender name or email fragment"),
+    to: z.string().max(500).optional().describe("Recipient name or email fragment"),
+    subject: z.string().max(500).optional().describe("Subject text to match"),
+    text: z.string().max(1000).optional().describe("Text to match anywhere in the message"),
+    limit: z.number().int().min(1).max(50).default(10),
+  })
+  .refine(
+    (value) => Boolean(value.from?.trim() || value.to?.trim() || value.subject?.trim() || value.text?.trim()),
+    { message: "Provide at least one search field: from, to, subject, or text." },
+  );
+
 const handler = createMcpHandler((server) => {
   server.registerTool(
     "list_recent_emails",
     {
       title: "List recent iCloud emails",
       description:
-        "Lists recent messages in the connected iCloud Mail INBOX. Returns sender, subject, date, unread status, and IMAP UID. Use the UID with read_email to retrieve a message body.",
+        "Lists recent messages in the connected iCloud Mail Inbox or Sent mailbox. Returns mailbox, sender, recipient, subject, date, unread status, and IMAP UID. Use the UID and mailbox with read_email to retrieve a message body.",
       inputSchema: z.object({
         limit: z.number().int().min(1).max(20).default(5),
+        mailbox: mailboxSchema.default("inbox"),
       }),
       outputSchema: z.object({ emails: z.array(recentEmailSchema) }),
       annotations: {
@@ -96,11 +120,11 @@ const handler = createMcpHandler((server) => {
         openWorldHint: false,
       },
     },
-    async ({ limit }, ctx) => {
+    async ({ limit, mailbox }, ctx) => {
       try {
         const userId = authenticatedUserId(ctx);
         await assertMailboxOwner(userId);
-        const emails = await listRecentEmails(limit);
+        const emails = await listRecentEmails(limit, mailbox);
         const output = { emails };
 
         return {
@@ -123,13 +147,55 @@ const handler = createMcpHandler((server) => {
   );
 
   server.registerTool(
+    "search_emails",
+    {
+      title: "Search iCloud emails",
+      description:
+        "Searches the iCloud Mail Inbox, Sent mailbox, or both using sender, recipient, subject, or message text. Use mailbox=sent for questions such as 'when did I last email Pratyush?'. Results include mailbox and UID so read_email can open the matching message.",
+      inputSchema: searchInputSchema,
+      outputSchema: z.object({ emails: z.array(recentEmailSchema) }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ mailbox, from, to, subject, text, limit }, ctx) => {
+      try {
+        const userId = authenticatedUserId(ctx);
+        await assertMailboxOwner(userId);
+        const emails = await searchEmails({ mailbox, from, to, subject, text, limit });
+        const output = { emails };
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
+          structuredContent: output,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `iCloud Mail search failed: ${message}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  server.registerTool(
     "read_email",
     {
       title: "Read iCloud email",
       description:
-        "Reads one message from the connected iCloud Mail INBOX by IMAP UID. Returns headers, plain-text body, and attachment metadata. It does not download attachment contents or change read/unread state.",
+        "Reads one message from the connected iCloud Mail Inbox or Sent mailbox by IMAP UID. Returns headers, plain-text body, and attachment metadata. It does not download attachment contents or change read/unread state.",
       inputSchema: z.object({
-        uid: z.number().int().positive().describe("IMAP UID returned by list_recent_emails"),
+        uid: z.number().int().positive().describe("IMAP UID returned by list_recent_emails or search_emails"),
+        mailbox: mailboxSchema.default("inbox").describe("Mailbox returned with the UID"),
       }),
       outputSchema: z.object({ email: readEmailSchema }),
       annotations: {
@@ -139,11 +205,11 @@ const handler = createMcpHandler((server) => {
         openWorldHint: false,
       },
     },
-    async ({ uid }, ctx) => {
+    async ({ uid, mailbox }, ctx) => {
       try {
         const userId = authenticatedUserId(ctx);
         await assertMailboxOwner(userId);
-        const email = await readEmail(uid);
+        const email = await readEmail(uid, mailbox);
         const output = { email };
 
         return {

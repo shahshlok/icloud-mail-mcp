@@ -236,13 +236,21 @@ const handler = createMcpHandler((server) => {
     {
       title: "Send iCloud email",
       description:
-        "Immediately sends a plain-text email through the connected iCloud Mail account. This is a write action. The From address is fixed by the server and cannot be supplied by the caller.",
+        "Immediately sends an email through the connected iCloud Mail account. By default, body is Markdown and is sent as sanitized rich-text HTML plus a plain-text fallback. Markdown supports bold, italics, headings, lists, links, blockquotes, code, and simple tables. Set format=plain when rich formatting is not wanted. This is a write action. The From address is fixed by the server and cannot be supplied by the caller.",
       inputSchema: z.object({
         to: z.array(z.string().email()).min(1).max(20),
         cc: z.array(z.string().email()).max(20).optional(),
         bcc: z.array(z.string().email()).max(20).optional(),
         subject: z.string().min(1).max(998),
-        body: z.string().min(1).max(200_000),
+        body: z
+          .string()
+          .min(1)
+          .max(200_000)
+          .describe("Email body. Markdown formatting is supported when format=markdown."),
+        format: z
+          .enum(["markdown", "plain"])
+          .default("markdown")
+          .describe("Use markdown for rich-text email or plain for text-only email."),
       }),
       outputSchema: z.object({ result: sendResultSchema }),
       annotations: {
@@ -252,11 +260,11 @@ const handler = createMcpHandler((server) => {
         openWorldHint: true,
       },
     },
-    async ({ to, cc, bcc, subject, body }, ctx) => {
+    async ({ to, cc, bcc, subject, body, format }, ctx) => {
       try {
         const userId = authenticatedUserId(ctx);
         await assertMailboxOwner(userId);
-        const result = await sendEmail({ to, cc, bcc, subject, body });
+        const result = await sendEmail({ to, cc, bcc, subject, body, format });
         const output = { result };
 
         return {
